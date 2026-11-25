@@ -53,6 +53,12 @@ export interface Holding {
   addedUtc: string;
 }
 
+export interface User {
+  id: string;
+  email: string;
+  createdUtc: string;
+}
+
 export interface Portfolio {
   baseCurrency: string;
   holdings: Holding[];

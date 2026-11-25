@@ -6,8 +6,9 @@ import { HoldingSheet } from './components/HoldingSheet';
 import { PortfolioView } from './components/PortfolioView';
 import { ReportsView } from './components/ReportsView';
 import { SettingsView } from './components/SettingsView';
+import { AuthView } from './components/AuthView';
 import { timeAgo } from './format';
-import type { AddHoldingRequest, CategoryEdit, Holding, Meta, Portfolio, UpdateHoldingRequest, ValuationReport } from './types';
+import type { AddHoldingRequest, CategoryEdit, Holding, Meta, Portfolio, UpdateHoldingRequest, User, ValuationReport } from './types';
 
 type Tab = 'portfolio' | 'reports' | 'add' | 'settings';
 
@@ -20,6 +21,7 @@ const TABS: { id: Tab; label: string; icon: IconName }[] = [
 
 export default function App() {
   const [tab, setTab] = useState<Tab>('portfolio');
+  const [user, setUser] = useState<User | null>(null);
   const [portfolio, setPortfolio] = useState<Portfolio | null>(null);
   const [report, setReport] = useState<ValuationReport | null>(null);
   const [meta, setMeta] = useState<Meta | null>(null);
@@ -76,6 +78,8 @@ export default function App() {
     setBooting(true);
     setBootError(null);
     try {
+      const signedIn = await api.me();
+      setUser(signedIn);
       const [m, p] = await Promise.all([api.meta(), api.portfolio()]);
       setMeta(m);
       setPortfolio(p);
@@ -83,7 +87,12 @@ export default function App() {
       await loadReport();
     } catch (e) {
       setBooting(false);
-      setBootError(message(e));
+      if (e instanceof ApiError && e.status === 401) {
+        setUser(null);
+        setBootError(null);
+      } else {
+        setBootError(message(e));
+      }
     }
   }, [loadReport]);
 
@@ -195,6 +204,23 @@ export default function App() {
     }
   }, [loadReport, notify]);
 
+  const signOut = async () => {
+    try {
+      await api.logout();
+      setUser(null);
+      setPortfolio(null);
+      setReport(null);
+      setMeta(null);
+      setTab('portfolio');
+    } catch (e) {
+      notify(message(e), 'err');
+    }
+  };
+
+  if (!booting && !bootError && !user) {
+    return <AuthView onAuthenticated={(signedIn) => { setUser(signedIn); void bootstrap(); }} />;
+  }
+
   const holdings = portfolio?.holdings ?? [];
   const base = report?.baseCurrency ?? portfolio?.baseCurrency ?? 'USD';
   const subtitle = booting
@@ -207,11 +233,12 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <div>
-          <div className="topbar__title">Portfolio</div>
+          <div className="topbar__title">Glancefolio</div>
           <div className="topbar__sub">{subtitle}</div>
         </div>
         <span className="topbar__spacer" />
         {pricing && <span className="spinner" title="Fetching prices" />}
+        {user && <button className="btn btn--ghost btn--sm auth-signout" onClick={() => void signOut()} title={`Signed in as ${user.email}`}>Sign out</button>}
         <button
           className="btn btn--ghost btn--icon"
           onClick={() => void loadReport(true)}

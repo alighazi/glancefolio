@@ -8,6 +8,7 @@ import type {
   PutCategoriesResult,
   SearchResponse,
   UpdateHoldingRequest,
+  User,
   ValuationReport,
 } from './types';
 
@@ -59,6 +60,22 @@ export interface HoldingMutationResult {
 }
 
 export const api = {
+  me(): Promise<User> {
+    return req<User>('/api/auth/me', { credentials: 'same-origin' });
+  },
+
+  login(email: string, password: string): Promise<User> {
+    return req<User>('/api/auth/login', { method: 'POST', headers: JSON_HEADERS, credentials: 'same-origin', body: JSON.stringify({ email, password }) });
+  },
+
+  register(email: string, password: string): Promise<User> {
+    return req<User>('/api/auth/register', { method: 'POST', headers: JSON_HEADERS, credentials: 'same-origin', body: JSON.stringify({ email, password }) });
+  },
+
+  logout(): Promise<void> {
+    return req<void>('/api/auth/logout', { method: 'POST', credentials: 'same-origin' });
+  },
+
   search(q: string, take = 12, signal?: AbortSignal): Promise<SearchResponse> {
     const url = `/api/search?q=${encodeURIComponent(q)}&take=${take}`;
     return req<SearchResponse>(url, { signal });

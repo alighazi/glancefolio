@@ -60,6 +60,7 @@ src/Server/data/
 *.pfx
 secrets.json
 appsettings.*.Local.json
+deploy.conf
 
 # ---- logs -----------------------------------------------------------------
 *.log

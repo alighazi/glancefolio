@@ -1,10 +1,15 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http.Json;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.DataProtection;
+using Microsoft.AspNetCore.RateLimiting;
+using System.Threading.RateLimiting;
 using PortfolioWeb;
 
 // ---------------------------------------------------------------------------
-// Portfolio - ASP.NET Core minimal API
+// Glancefolio - ASP.NET Core minimal API
 //
 // Serves both the JSON API and the built single-page client from one origin, so
 // the browser never needs CORS or a second port. All market data comes from
@@ -31,8 +36,56 @@ var dataDir = Path.GetFullPath(
 builder.Services.AddHttpClient("providers", c =>
 {
     c.Timeout = TimeSpan.FromSeconds(15);
-    c.DefaultRequestHeaders.UserAgent.ParseAdd("PortfolioWeb/1.0 (personal finance; free public endpoints)");
+    c.DefaultRequestHeaders.UserAgent.ParseAdd("Glancefolio/1.0 (personal finance; free public endpoints)");
     c.DefaultRequestHeaders.Accept.ParseAdd("application/json");
+});
+
+builder.Services.AddDataProtection()
+    .PersistKeysToFileSystem(new DirectoryInfo(Path.Combine(dataDir, "keys")))
+    .SetApplicationName("Glancefolio");
+
+builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme).AddCookie(options =>
+{
+    options.Cookie.Name = "glancefolio.auth";
+    options.Cookie.HttpOnly = true;
+    options.Cookie.SameSite = SameSiteMode.Strict;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.SameAsRequest;
+    options.ExpireTimeSpan = TimeSpan.FromDays(14);
+    options.SlidingExpiration = true;
+    options.Events.OnRedirectToLogin = context =>
+    {
+        context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        return Task.CompletedTask;
+    };
+    options.Events.OnRedirectToAccessDenied = context =>
+    {
+        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        return Task.CompletedTask;
+    };
+});
+builder.Services.AddAuthorization(options =>
+{
+    options.FallbackPolicy = new Microsoft.AspNetCore.Authorization.AuthorizationPolicyBuilder()
+        .RequireAuthenticatedUser().Build();
+});
+builder.Services.AddRateLimiter(options => options.AddPolicy("auth", context =>
+    RateLimitPartition.GetFixedWindowLimiter(
+        context.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+        _ => new FixedWindowRateLimiterOptions
+        {
+            PermitLimit = 10,
+            Window = TimeSpan.FromMinutes(1),
+            QueueLimit = 0,
+            AutoReplenishment = true
+        })));
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddSingleton(_ => new UserStore(Path.Combine(dataDir, "users.json")));
+builder.Services.AddScoped(sp =>
+{
+    var userId = AuthHelpers.UserId(sp.GetRequiredService<IHttpContextAccessor>().HttpContext?.User ?? new System.Security.Claims.ClaimsPrincipal());
+    if (string.IsNullOrWhiteSpace(userId)) throw new InvalidOperationException("An authenticated user is required.");
+    var logger = sp.GetRequiredService<ILogger<PortfolioStore>>();
+    return new PortfolioStore(Path.Combine(dataDir, "users", userId, "portfolio.json"), logger);
 });
 
 builder.Services.AddSingleton<QuotaMeter>();
@@ -43,16 +96,27 @@ builder.Services.AddSingleton<CryptoService>();
 builder.Services.AddSingleton<YahooService>();
 builder.Services.AddSingleton<SearchService>();
 builder.Services.AddSingleton<PriceService>();
-builder.Services.AddSingleton(sp => new PortfolioStore(
-    Path.Combine(dataDir, "portfolio.json"), sp.GetRequiredService<ILogger<PortfolioStore>>()));
 builder.Services.AddHostedService<WarmupService>();
 
 var app = builder.Build();
 
-// Bind explicitly: the preview proxies to this port, and 0.0.0.0 is required
-// for anything outside the sandbox to reach it.
+// The production host terminates TLS in front of Kestrel. Honor its forwarded
+// host/scheme so secure cookies and same-origin validation use the public URL.
+var forwardedHeaders = new Microsoft.AspNetCore.Builder.ForwardedHeadersOptions
+{
+    ForwardedHeaders = Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedFor
+                     | Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedProto
+                     | Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedHost
+};
+// Keep the framework's trusted-proxy defaults (loopback only). The bare-metal
+// deploy script binds Kestrel to localhost and proxies through local Nginx.
+app.UseForwardedHeaders(forwardedHeaders);
+
+// Bind explicitly. Production deploys can keep Kestrel private behind Nginx
+// with BIND_ADDRESS=127.0.0.1; local/preview runs retain the 0.0.0.0 default.
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
-app.Urls.Add($"http://0.0.0.0:{port}");
+var bindAddress = Environment.GetEnvironmentVariable("BIND_ADDRESS") ?? "0.0.0.0";
+app.Urls.Add($"http://{bindAddress}:{port}");
 
 if (app.Environment.IsDevelopment())
 {
@@ -61,6 +125,21 @@ if (app.Environment.IsDevelopment())
 
 app.UseDefaultFiles();
 app.UseStaticFiles();
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/api") &&
+        context.Request.Method is not ("GET" or "HEAD" or "OPTIONS") &&
+        !AuthHelpers.IsSameOrigin(context))
+    {
+        context.Response.StatusCode = StatusCodes.Status403Forbidden;
+        await context.Response.WriteAsJsonAsync(new { error = "cross-origin request rejected" });
+        return;
+    }
+    await next();
+});
+app.UseRateLimiter();
+app.UseAuthentication();
+app.UseAuthorization();
 
 // ---------------------------------------------------------------------------
 // Endpoints
@@ -70,9 +149,65 @@ app.MapGet("/api/health", () => Results.Ok(new
 {
     status = "ok",
     time = DateTimeOffset.UtcNow,
-    dataDir,
     version = typeof(Program).Assembly.GetName().Version?.ToString() ?? "1.0"
-}));
+})).AllowAnonymous();
+
+app.MapGet("/api/auth/me", (HttpContext context) =>
+{
+    var id = AuthHelpers.UserId(context.User);
+    if (id is null) return Results.Unauthorized();
+    var createdClaim = context.User.FindFirst("glancefolio_created_utc")?.Value;
+    var createdUtc = DateTime.TryParse(createdClaim, out var created) ? created : DateTime.UtcNow;
+    return Results.Ok(new PublicAccount(id, context.User.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value ?? "", createdUtc));
+}).AllowAnonymous();
+
+app.MapPost("/api/auth/register", async (AuthRequest request, UserStore users, HttpContext context, ILogger<Program> log, CancellationToken ct) =>
+{
+    var email = request.Email?.Trim() ?? "";
+    var password = request.Password ?? "";
+    if (email.Length is < 3 or > 254 || !System.Text.RegularExpressions.Regex.IsMatch(email, @"^[^\s@]+@[^\s@]+\.[^\s@]+$"))
+        return Results.Json(new { error = "enter a valid email address" }, statusCode: 400);
+    if (password.Length < 12 || password.Length > 200)
+        return Results.Json(new { error = "password must be at least 12 characters" }, statusCode: 400);
+    var creation = await users.CreateAsync(email, password, ct);
+    if (creation is null) return Results.Json(new { error = "an account with that email already exists" }, statusCode: 409);
+    var account = creation.User;
+    if (creation.IsFirstAccount)
+    {
+        var legacy = Path.Combine(dataDir, "portfolio.json");
+        var target = Path.Combine(dataDir, "users", account.Id, "portfolio.json");
+        if (File.Exists(legacy))
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                File.Copy(legacy, target, overwrite: false);
+                log.LogInformation("migrated the existing portfolio into the first Glancefolio account");
+            }
+            catch (Exception ex) { log.LogWarning(ex, "could not migrate the legacy portfolio; original file remains available for import"); }
+        }
+    }
+    await SignIn(context, account);
+    return Results.Ok(account);
+}).AllowAnonymous().RequireRateLimiting("auth");
+
+app.MapPost("/api/auth/login", async (AuthRequest request, UserStore users, HttpContext context, CancellationToken ct) =>
+{
+    var email = request.Email?.Trim() ?? "";
+    var password = request.Password ?? "";
+    if (email.Length > 254 || password.Length > 200 || password.Length == 0)
+        return Results.Json(new { error = "email or password is incorrect" }, statusCode: 401);
+    var account = await users.VerifyAsync(email, password, ct);
+    if (account is null) return Results.Json(new { error = "email or password is incorrect" }, statusCode: 401);
+    await SignIn(context, account);
+    return Results.Ok(account);
+}).AllowAnonymous().RequireRateLimiting("auth");
+
+app.MapPost("/api/auth/logout", async (HttpContext context) =>
+{
+    await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+    return Results.NoContent();
+});
 
 /// <summary>
 /// Unified symbol search. Every item carries its provider-native id and kind,
@@ -364,14 +499,29 @@ app.MapPost("/api/portfolio/import", async (PortfolioStore store, FxService fx, 
 });
 
 // Single-page client: unknown non-API paths fall through to index.html.
-app.MapFallbackToFile("index.html");
+// The SPA must be available before sign-in so it can render the auth screen.
+// Portfolio/API endpoints remain protected by the fallback authorization policy.
+app.MapFallbackToFile("index.html").AllowAnonymous();
 
-app.Logger.LogInformation("portfolio data directory: {DataDir}", dataDir);
+app.Logger.LogInformation("Glancefolio data directory: {DataDir}", dataDir);
 app.Run();
 
 // ---------------------------------------------------------------------------
 // Request DTOs and validation
 // ---------------------------------------------------------------------------
+
+static Task SignIn(HttpContext context, PublicAccount account)
+{
+    var claims = new[]
+    {
+        new System.Security.Claims.Claim(AuthHelpers.UserIdClaim, account.Id),
+        new System.Security.Claims.Claim(System.Security.Claims.ClaimTypes.Email, account.Email),
+        new System.Security.Claims.Claim("glancefolio_created_utc", account.CreatedUtc.ToString("O"))
+    };
+    var identity = new System.Security.Claims.ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+    return context.SignInAsync(CookieAuthenticationDefaults.AuthenticationScheme,
+        new System.Security.Claims.ClaimsPrincipal(identity));
+}
 
 static string? Validate(AddHoldingRequest req, IReadOnlySet<string> currencies, IReadOnlyList<CategoryDef> categories)
 {
