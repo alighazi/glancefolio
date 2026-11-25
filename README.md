@@ -1,10 +1,10 @@
-# Portfolio — a mobile-first mixed-asset tracker
+# Glancefolio — a mobile-first mixed-asset tracker
 
 Track cash, crypto, stocks, funds, indices, futures and things no provider has
 ever heard of in one place, valued in the currency you actually think in.
 
-**.NET 10 backend · React 18 + TypeScript + Vite front end · no API keys, no
-accounts, no paid services, no NuGet or npm runtime dependencies beyond React.**
+**.NET 10 backend · React 18 + TypeScript + Vite front end · email/password
+accounts · private per-user portfolios · no API keys or paid services.**
 
 ```
 ┌─────────────────────────────┐          ┌──────────────────────────────┐
@@ -42,9 +42,24 @@ npm run dev          # Vite on :5173, /api proxied to :5000
 npm run build        # tsc --noEmit, then bundle into ../Server/wwwroot
 ```
 
-Environment: `PORT` / `ASPNETCORE_URLS` choose the port, `--data <dir>` (or
-`PORTFOLIO_DATA`) chooses where `portfolio.json` and the cache live
-(default `src/Server/data`).
+Environment: `PORT` / `ASPNETCORE_URLS` choose the port, and `PORTFOLIO_DATA_DIR`
+chooses the data root (default `src/Server/data`). Accounts are stored in
+`users.json`; each account's portfolio is under `users/<account-id>/portfolio.json`.
+
+### Bare-metal deployment (Ubuntu 24.04)
+
+From a fresh or updated checkout on the server, run:
+
+```bash
+sudo ./deploy-ubuntu24.sh
+```
+
+The script installs .NET 10 and Bun when missing, builds the client and server,
+installs a versioned release, and runs it as a systemd service. It checks
+`/api/health` and rolls back to the previous release if the service fails to
+start. User data persists under `/var/lib/glancefolio`; configure HTTPS and a
+reverse proxy before exposing the service publicly. Useful overrides include
+`PORT`, `DATA_DIR`, `INSTALL_ROOT`, `APP_USER`, and `SERVICE_NAME`.
 
 ---
 
@@ -220,12 +235,21 @@ and 57 other real currencies.
 
 ---
 
-## Data
+## Accounts and data
 
-One file, `src/Server/data/portfolio.json`. Writes go to a temp file that is
-then moved into place, so a crash mid-write cannot truncate it, and the previous
-version is kept next to it as `.bak`. A semaphore serialises the
-load-modify-save cycle, so two concurrent edits cannot lose one.
+Create an account with an email address and a password of at least 12 characters,
+or sign in to an existing account. Passwords are stored as salted PBKDF2-SHA256
+hashes; the browser session uses a protected, HTTP-only, SameSite-strict cookie.
+Portfolio and holding endpoints require an authenticated session, and each
+account has its own portfolio file under `users/<account-id>/portfolio.json`.
+The shared account index is `users.json`. Keep the data directory private and
+back it up regularly. On first registration, an existing legacy
+`portfolio.json` is copied into the first account (the original remains intact).
+
+Each portfolio is written to a temporary file then moved into place, so a crash
+mid-write cannot truncate it, and the previous version is kept next to it as
+`.bak`. A semaphore serialises the load-modify-save cycle, so concurrent edits
+cannot lose one another.
 
 Loading repairs rather than rejects: duplicate or missing ids get fresh ones, an
 unknown category is cleared so detection can choose, a zero or negative manual
@@ -248,9 +272,9 @@ never rewritten on load — the report shows USD and says why instead.
 
 | Suite | What it covers | Result |
 |---|---|---|
-| `dotnet test` (156 tests) | category detection and its two overrides, **a user-edited category list** (renames keeping their binding, deletions reporting `Uncategorised`, `NormalizeCategories` repair, group order from your list), `YahooKinds` mapping, FX inversion and cross rates, disk-cache TTL/stale/atomicity/`Clear(prefix)`/`Prune`, token-bucket burst-and-wait, `Valuation.Build` money maths, weights, gain/loss, unpriced rows, `PortfolioStore.Normalize`, corrupt-file recovery, concurrent writes | **156 passed** |
-| `tests/api_e2e.py` (116 checks) | every endpoint against the **live** server and **live** providers: an 11-holding mixed portfolio, auto-categorisation, the PAXG regression, FX-pair currency routing, report arithmetic (totals, weights summing to 100, category sums), base-currency switching, refresh, export/import round-trip, **renaming/deleting/adding categories and what that does to the holdings**, and 27 rejection cases | **all passed** |
-| `src/Client/uismoke/run.mjs` (140 checks) | the **real React bundle** rendered in jsdom against the real API, tapped through: search → autocomplete with logo, name, price, category → pick → amount → add → toast; the collision not being collapsed; the manual fallback; the edit sheet; two-tap delete; **the donut (arc widths against the report's shares, tiling without overlap, tap-to-focus, screen-reader label)**; **the category editor (rename → save → holdings follow → delete → `Uncategorised` → restore defaults)**; base-currency switch re-rendering the hero; the empty first-run screen; quota table; and an assertion that **every** request the client made was relative | **140 passed, no console errors** |
+| `dotnet test` | account registration, duplicate-email rejection and password verification, plus category detection, FX, caching, valuation and portfolio persistence | Run locally with `dotnet test` |
+| `tests/api_e2e.py` | authenticated API coverage, including anonymous-access rejection, registration/session cookies, holdings, reports, import/export and categories | Run against the live server |
+| `src/Client/uismoke/run.mjs` | the real React bundle in jsdom, including sign-in state, search/add, reports, categories, settings and relative-URL checks | Run against the live server |
 
 There is no browser in this sandbox, so the UI suite drives React in jsdom and
 hooks `console.error` — which is how a duplicate-key warning in the currency
@@ -290,16 +314,18 @@ finishes with the six-holding demo portfolio and the built-in list in place.
 web/
 ├── env.sh                      toolchain PATH for the .NET SDK in ~/.local
 ├── run-tests.sh                all three suites
-├── Portfolio.sln
+├── Portfolio.slnx
+├── deploy-ubuntu24.sh          bare-metal Ubuntu 24.04 build/deploy script
 ├── src/Server/                 ASP.NET Core, no external packages
-│   ├── Program.cs              endpoints, DI, validation, cache warm-up
+│   ├── Program.cs              endpoints, auth, DI, validation, cache warm-up
+│   ├── Auth.cs                  password hashing, account store, origin checks
 │   ├── Providers.cs            HTTP client, FX, CoinGecko, Yahoo, kind mapping
 │   ├── Caching.cs              disk cache, token bucket, quota meter
 │   ├── Search.cs               categories + the merged, ranked search
 │   ├── Prices.cs               quote resolution + Valuation.Build
 │   ├── Store.cs                atomic single-file persistence + Normalize
 │   ├── Models.cs, Json.cs, Currencies.cs
-│   ├── data/                   portfolio.json, portfolio.json.bak, cache/
+│   ├── data/                   users.json, users/<id>/, keys/, cache/
 │   └── wwwroot/                built client (generated)
 ├── src/Client/                 React 18 + TS strict + Vite
 │   ├── src/App.tsx             shell, data layer, toasts, tab bar
@@ -310,6 +336,6 @@ web/
 │   ├── src/api.ts, types.ts, format.ts, palette.ts
 │   └── uismoke/                jsdom driver for the UI suite
 └── tests/
-    ├── Server.Tests/           xunit, 156 tests
+    ├── Server.Tests/           xunit, including auth tests
     └── api_e2e.py              live end-to-end API checks
 ```

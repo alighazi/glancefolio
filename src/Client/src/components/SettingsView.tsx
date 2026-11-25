@@ -268,7 +268,7 @@ export function SettingsView({ portfolio, meta, base, onBaseCurrency, onCategori
           <li><strong>open.er-api.com</strong> — 166 currency rates against USD</li>
         </ul>
         <p className="field__hint" style={{ margin: '12px 0 0' }}>
-          No API keys, no accounts. All three are free tiers, so the app never
+          No API keys are needed. All three are free tiers, so the app never
           requests more than it needs and always keeps the last good value.
         </p>
       </Card>

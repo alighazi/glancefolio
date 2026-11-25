@@ -8,9 +8,11 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import http.cookiejar
 
 BASE = "http://127.0.0.1:5000"
 FAILURES = []
+OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
 
 def call(method, path, body=None):
@@ -21,7 +23,7 @@ def call(method, path, body=None):
     )
     t0 = time.time()
     try:
-        with urllib.request.urlopen(req, timeout=90) as r:
+        with OPENER.open(req, timeout=90) as r:
             text = r.read().decode()
             ms = int((time.time() - t0) * 1000)
             return r.status, (json.loads(text) if text else None), ms
@@ -39,6 +41,19 @@ def check(label, cond, detail=""):
     if not cond:
         FAILURES.append(label)
 
+
+# ---------------------------------------------------------------- authentication
+# Private portfolio APIs reject anonymous requests; create a fresh test user and
+# retain its session cookie for the remainder of this run.
+try:
+    with urllib.request.urlopen(BASE + "/api/portfolio", timeout=10) as response:
+        anonymous_status = response.status
+except urllib.error.HTTPError as exc:
+    anonymous_status = exc.code
+check("portfolio is unavailable without authentication", anonymous_status == 401, f"HTTP {anonymous_status}")
+email = f"api-e2e-{time.time_ns()}@example.test"
+st, user, _ = call("POST", "/api/auth/register", dict(email=email, password="api-e2e-test-password-2026"))
+check("register creates an account and session", st == 200 and user.get("email") == email, f"HTTP {st}")
 
 # ---------------------------------------------------------------- start clean
 st, _, _ = call("GET", "/api/portfolio")

@@ -22,6 +22,7 @@ const NOT_FOUND = 'qqzznotfound';
 const failures = [];
 const requestedUrls = [];
 const consoleErrors = [];
+let authCookie = '';
 
 function check(label, ok, detail = '') {
   console.log(`[${ok ? 'ok  ' : 'FAIL'}] ${label}${detail ? ` -- ${detail}` : ''}`);
@@ -67,11 +68,19 @@ window.addEventListener('unhandledrejection', (e) => consoleErrors.push(`unhandl
 // Relative URL -> the real server. Anything absolute is a violation: browser
 // code must never name a host, or it breaks behind the preview proxy.
 const nodeFetch = globalThis.fetch;
+const authorizedFetch = async (url, init = {}) => {
+  const headers = new Headers(init.headers ?? {});
+  if (authCookie) headers.set('Cookie', authCookie);
+  const response = await nodeFetch(url, { ...init, headers });
+  const setCookie = response.headers.get('set-cookie');
+  if (setCookie) authCookie = setCookie.split(';', 1)[0];
+  return response;
+};
 globalThis.fetch = async (input, init) => {
   const raw = typeof input === 'string' ? input : input.url;
   requestedUrls.push(raw);
   if (/^https?:\/\//i.test(raw)) throw new Error(`client requested an absolute URL: ${raw}`);
-  return nodeFetch(new URL(raw, ORIGIN).toString(), init);
+  return authorizedFetch(new URL(raw, ORIGIN).toString(), init);
 };
 window.fetch = globalThis.fetch;
 
@@ -108,12 +117,18 @@ const click = (el) => {
 };
 const settle = (ms = 150) => sleep(ms);
 const byText = (sel, re) => $$(sel).find((e) => re.test(e.textContent ?? ''));
-const api = async (p) => nodeFetch(`${ORIGIN}${p}`).then((r) => r.json());
+const api = async (p) => authorizedFetch(`${ORIGIN}${p}`).then((r) => r.json());
 
 // ------------------------------------------------------------------------ run
 
 async function main() {
   console.log(`server:      ${ORIGIN}\npage origin: ${PAGE_ORIGIN}\n`);
+
+  const auth = await authorizedFetch(`${ORIGIN}/api/auth/register`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: `ui-${Date.now()}@example.test`, password: 'smoke-test-password-123' }),
+  });
+  check('test account created and authenticated', auth.ok, `HTTP ${auth.status}`);
 
   const health = await api('/api/health');
   check('API is up', health.status === 'ok', JSON.stringify(health));
@@ -127,7 +142,7 @@ async function main() {
   // was left renamed would have the server clear it on the way in.
   const meta0 = await api('/api/meta');
   const defaultCategories = meta0.defaultCategories.map((c) => c.name);
-  await nodeFetch(`${ORIGIN}/api/categories`, {
+  await authorizedFetch(`${ORIGIN}/api/categories`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ categories: defaultCategories.map((name) => ({ name })) }),
@@ -152,7 +167,7 @@ async function main() {
     ],
     updatedUtc: new Date().toISOString(),
   };
-  const seeded = await nodeFetch(`${ORIGIN}/api/portfolio`, {
+  const seeded = await authorizedFetch(`${ORIGIN}/api/portfolio`, {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(seed),
   }).then((r) => {
     if (!r.ok) throw new Error(`could not seed the portfolio: HTTP ${r.status}`);
@@ -165,7 +180,7 @@ async function main() {
 
   // ---- shell -------------------------------------------------------------
   await waitFor('the app to mount', () => $('.topbar'));
-  check('top bar rendered', $('.topbar__title')?.textContent === 'Portfolio', $('.topbar__title')?.textContent);
+  check('top bar rendered', $('.topbar__title')?.textContent === 'Glancefolio', $('.topbar__title')?.textContent);
   check('bottom nav has four tabs', $$('.nav__item').length === 4, `${$$('.nav__item').length}`);
   check('nav has the raised add button', Boolean($('.nav__add .nav__plus')));
 
@@ -668,7 +683,7 @@ async function main() {
         $('.topbar__sub')?.textContent);
 
   // Restore through the import path, which is the same PUT the file upload uses.
-  const restored = await nodeFetch(`${ORIGIN}/api/portfolio`, {
+  const restored = await authorizedFetch(`${ORIGIN}/api/portfolio`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(snapshot),
