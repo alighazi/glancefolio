@@ -27,29 +27,60 @@ source /etc/os-release
 [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "PORT must be a valid TCP port."
 
 install_build_tools() {
-  if ! command -v dotnet >/dev/null 2>&1 || ! dotnet --list-sdks 2>/dev/null | grep -q '^10\.' || \
-     ! command -v node >/dev/null 2>&1 || [[ "$(node -p 'Number(process.versions.node.split(".")[0])' 2>/dev/null || echo 0)" -lt 20 ]]; then
-    log "Installing .NET 10 SDK and Node.js 22 build tools"
-    apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg
+  local need_dotnet=false
+  local need_bun=false
+  if ! command -v dotnet >/dev/null 2>&1 || ! dotnet --list-sdks 2>/dev/null | grep -q '^10\.'; then
+    need_dotnet=true
+  fi
+  command -v bun >/dev/null 2>&1 || need_bun=true
 
+  if [[ "$need_dotnet" == true || "$need_bun" == true ]]; then
+    log "Installing required build tools"
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl gnupg unzip python3
+  fi
+
+  if [[ "$need_dotnet" == true ]]; then
     # Microsoft packages for .NET 10 on Ubuntu 24.04.
     local ms_deb
     ms_deb="$(mktemp --suffix=.deb)"
     curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb -o "$ms_deb"
     dpkg -i "$ms_deb"
     rm -f "$ms_deb"
-
-    # NodeSource provides the current Node.js 22 packages (Vite/UI build needs Node 20+).
-    install -d -m 0755 /etc/apt/keyrings
-    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-      | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg
-    chmod 0644 /etc/apt/keyrings/nodesource.gpg
-    printf 'deb [arch=%s signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main\n' \
-      "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/nodesource.list
-
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y dotnet-sdk-10.0 nodejs
+    DEBIAN_FRONTEND=noninteractive apt-get install -y dotnet-sdk-10.0
+  fi
+
+  if [[ "$need_bun" == true ]]; then
+    # Download official Bun for this architecture and verify the SHA-256 digest
+    # published in the corresponding GitHub release metadata.
+    local bun_arch bun_name release_json bun_zip bun_extract bun_asset bun_url bun_sha
+    case "$(dpkg --print-architecture)" in
+      amd64) bun_arch=x64 ;;
+      arm64) bun_arch=aarch64 ;;
+      *) die "Bun deployment supports Ubuntu amd64 and arm64 servers only." ;;
+    esac
+    bun_name="bun-linux-$bun_arch.zip"
+    release_json="$(mktemp)"
+    bun_zip="$(mktemp --suffix=.zip)"
+    bun_extract="$(mktemp -d)"
+    curl -fsSL https://api.github.com/repos/oven-sh/bun/releases/latest -o "$release_json"
+    bun_asset="$(python3 - "$release_json" "$bun_name" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as file:
+    release = json.load(file)
+asset = next((item for item in release.get("assets", []) if item.get("name") == sys.argv[2]), None)
+if not asset or not asset.get("digest", "").startswith("sha256:"):
+    raise SystemExit("Bun release asset or its published SHA-256 digest is missing")
+print(asset["browser_download_url"], asset["digest"].split(":", 1)[1])
+PY
+    )" || die "Could not resolve the verified Bun release asset."
+    read -r bun_url bun_sha <<< "$bun_asset"
+    curl -fsSL "$bun_url" -o "$bun_zip"
+    printf '%s  %s\n' "$bun_sha" "$bun_zip" | sha256sum --check --status || die "Bun archive checksum verification failed."
+    unzip -q "$bun_zip" -d "$bun_extract"
+    install -m 0755 "$bun_extract/bun-linux-$bun_arch/bun" /usr/local/bin/bun
+    rm -rf "$release_json" "$bun_zip" "$bun_extract"
   fi
 }
 
@@ -70,9 +101,9 @@ RELEASE_DIR="$RELEASES_DIR/$RELEASE_ID"
 cleanup() { rm -rf "$BUILD_DIR"; }
 trap cleanup EXIT
 
-log "Building the React client"
-npm --prefix "$CLIENT_DIR" ci
-npm --prefix "$CLIENT_DIR" run build
+log "Building the React client with Bun"
+bun install --cwd "$CLIENT_DIR" --no-save
+bun run --cwd "$CLIENT_DIR" build
 
 log "Publishing the .NET server"
 dotnet publish "$SERVER_PROJECT" --configuration Release --output "$BUILD_DIR/publish" --nologo
