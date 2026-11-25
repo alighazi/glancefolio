@@ -55,8 +55,11 @@ sudo ./deploy-ubuntu24.sh
 ```
 
 The script prompts for the site domain and Nginx listener port (default `80`),
-installs Nginx, and configures it to proxy that domain/port to the app on
-localhost. It installs .NET 10 and Bun if missing, builds the client and server,
+checks for existing listeners, installs Nginx, and configures it to proxy that
+domain/port to the app on localhost. If Apache owns the requested port, the
+script stops and suggests how to disable the old virtual host; an existing Nginx
+listener is allowed to share the port, with guidance for removing a conflicting
+old site if necessary. It installs .NET 10 and Bun if missing, builds the client and server,
 installs a versioned release, and runs a systemd service. The health check
 verifies startup and rolls back to the previous release if it fails. User data
 persists under `/var/lib/glancefolio`.

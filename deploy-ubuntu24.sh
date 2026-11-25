@@ -62,6 +62,50 @@ if [[ "$ENABLE_TLS" == true ]]; then
   [[ "$CERTBOT_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "CERTBOT_EMAIL must be a valid email address."
 fi
 
+check_nginx_port() {
+  command -v ss >/dev/null 2>&1 || die "The ss utility is required for port checks (install the iproute2 package)."
+  local listeners
+  listeners="$(ss -H -ltnp "sport = :$NGINX_PORT" 2>/dev/null || true)"
+  if [[ -z "$listeners" ]]; then
+    log "Nginx port $NGINX_PORT is not currently in use"
+    return
+  fi
+
+  log "Preflight: port $NGINX_PORT already has a listener"
+  printf '%s\n' "$listeners"
+  if grep -Eq '"(apache2|httpd)"' <<< "$listeners"; then
+    cat >&2 <<EOF
+Port $NGINX_PORT is occupied by Apache. Nginx cannot bind the same public port.
+If that old site is no longer needed, disable its Apache virtual host, then reload Apache:
+  sudo a2dissite <old-site>.conf
+  sudo apachectl configtest && sudo systemctl reload apache2
+If you intend to remove that website entirely, back up its files/config first. Otherwise choose a different NGINX_PORT.
+EOF
+    die "Free Nginx port $NGINX_PORT and rerun the deployment."
+  fi
+
+  if grep -q '"nginx"' <<< "$listeners"; then
+    cat <<EOF
+Nginx already listens on port $NGINX_PORT. Multiple Nginx websites can share a port,
+so this deploy will add a separate virtual host for $DOMAIN. If an existing site
+already owns that domain, disable/remove its site first:
+  ls -l /etc/nginx/sites-enabled/
+  sudo unlink /etc/nginx/sites-enabled/<old-site>
+  sudo nginx -t && sudo systemctl reload nginx
+EOF
+    return
+  fi
+
+  cat >&2 <<EOF
+Port $NGINX_PORT is occupied by a service other than Nginx or Apache:
+$listeners
+Stop/reconfigure that service or select a free NGINX_PORT before deploying.
+EOF
+  die "Nginx port $NGINX_PORT is unavailable."
+}
+
+check_nginx_port
+
 install_build_tools() {
   local need_dotnet=false
   local need_bun=false
@@ -252,8 +296,18 @@ if [[ "$ready" != true ]]; then
 fi
 
 log "Checking the Nginx domain/port route"
-curl -fsS --max-time 5 -H "Host: $DOMAIN" \
-  "http://127.0.0.1:$NGINX_PORT/api/health" >/dev/null || die "Nginx did not proxy $DOMAIN:$NGINX_PORT to the app."
+if ! route_health="$(curl -fsS --max-time 5 -H "Host: $DOMAIN" \
+  "http://127.0.0.1:$NGINX_PORT/api/health")" ||
+   ! grep -Eq '"status"[[:space:]]*:[[:space:]]*"ok"' <<< "$route_health"; then
+  cat >&2 <<EOF
+Nginx did not route $DOMAIN:$NGINX_PORT to Glancefolio. An existing virtual host may
+already be claiming this domain. Inspect /etc/nginx/sites-enabled/ and disable
+that old website if it is no longer needed:
+  sudo unlink /etc/nginx/sites-enabled/<old-site>
+  sudo nginx -t && sudo systemctl reload nginx
+EOF
+  die "Nginx domain/port health check failed."
+fi
 
 # When using the standard HTTP port, issue and configure a trusted TLS cert by
 # default. DNS for DOMAIN must point here and ports 80/443 must reach this host.
