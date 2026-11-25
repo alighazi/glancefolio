@@ -108,16 +108,15 @@ var forwardedHeaders = new Microsoft.AspNetCore.Builder.ForwardedHeadersOptions
                      | Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedProto
                      | Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedHost
 };
-// This app is deployed behind the host's edge proxy; forwarded headers from
-// that proxy need to be accepted even though its internal addresses vary.
-forwardedHeaders.KnownNetworks.Clear();
-forwardedHeaders.KnownProxies.Clear();
+// Keep the framework's trusted-proxy defaults (loopback only). The bare-metal
+// deploy script binds Kestrel to localhost and proxies through local Nginx.
 app.UseForwardedHeaders(forwardedHeaders);
 
-// Bind explicitly: the preview proxies to this port, and 0.0.0.0 is required
-// for anything outside the sandbox to reach it.
+// Bind explicitly. Production deploys can keep Kestrel private behind Nginx
+// with BIND_ADDRESS=127.0.0.1; local/preview runs retain the 0.0.0.0 default.
 var port = Environment.GetEnvironmentVariable("PORT") ?? "5000";
-app.Urls.Add($"http://0.0.0.0:{port}");
+var bindAddress = Environment.GetEnvironmentVariable("BIND_ADDRESS") ?? "0.0.0.0";
+app.Urls.Add($"http://{bindAddress}:{port}");
 
 if (app.Environment.IsDevelopment())
 {

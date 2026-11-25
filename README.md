@@ -54,12 +54,24 @@ From a fresh or updated checkout on the server, run:
 sudo ./deploy-ubuntu24.sh
 ```
 
-The script installs .NET 10 and Bun when missing, builds the client and server,
-installs a versioned release, and runs it as a systemd service. It checks
-`/api/health` and rolls back to the previous release if the service fails to
-start. User data persists under `/var/lib/glancefolio`; configure HTTPS and a
-reverse proxy before exposing the service publicly. Useful overrides include
-`PORT`, `DATA_DIR`, `INSTALL_ROOT`, `APP_USER`, and `SERVICE_NAME`.
+The script prompts for the site domain and Nginx listener port (default `80`),
+installs Nginx, and configures it to proxy that domain/port to the app on
+localhost. It installs .NET 10 and Bun if missing, builds the client and server,
+installs a versioned release, and runs a systemd service. The health check
+verifies startup and rolls back to the previous release if it fails. User data
+persists under `/var/lib/glancefolio`.
+
+On port `80`, HTTPS via Let's Encrypt is enabled by default; point the domain's
+DNS to this server and allow inbound ports `80` and `443`. The script prompts
+for the certificate email. For a custom HTTP listener port, TLS defaults off;
+use an external TLS terminator if you need HTTPS there. Non-interactive example:
+
+```bash
+sudo DOMAIN=portfolio.example.com NGINX_PORT=80 CERTBOT_EMAIL=admin@example.com ./deploy-ubuntu24.sh
+```
+
+`PORT` selects Kestrel's private localhost upstream port. Other overrides:
+`DATA_DIR`, `INSTALL_ROOT`, `APP_USER`, and `SERVICE_NAME`.
 
 ---
 

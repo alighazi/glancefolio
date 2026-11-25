@@ -9,7 +9,11 @@ APP_GROUP="${APP_GROUP:-glancefolio}"
 INSTALL_ROOT="${INSTALL_ROOT:-/opt/glancefolio}"
 DATA_DIR="${DATA_DIR:-/var/lib/glancefolio}"
 SERVICE_NAME="${SERVICE_NAME:-glancefolio}"
-PORT="${PORT:-5000}"
+PORT="${PORT:-5000}"                 # Kestrel upstream port (localhost only)
+DOMAIN="${DOMAIN:-}"
+NGINX_PORT="${NGINX_PORT:-}"
+ENABLE_TLS="${ENABLE_TLS:-}"
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CLIENT_DIR="$ROOT_DIR/src/Client"
 SERVER_PROJECT="$ROOT_DIR/src/Server/Server.csproj"
@@ -25,6 +29,38 @@ source /etc/os-release
 [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == 24.04 ]] || die "This script supports Ubuntu 24.04 only (detected ${PRETTY_NAME:-unknown})."
 [[ -f "$CLIENT_DIR/package-lock.json" && -f "$SERVER_PROJECT" ]] || die "Run this script from the Glancefolio repository checkout."
 [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "PORT must be a valid TCP port."
+
+if [[ -z "$DOMAIN" ]]; then
+  [[ -t 0 ]] || die "Set DOMAIN=example.com, or run interactively to enter the site domain."
+  read -r -p "Domain name for Glancefolio: " DOMAIN
+fi
+[[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "DOMAIN must be a hostname or IPv4 address (no scheme, path, or port)."
+
+if [[ -z "$NGINX_PORT" ]]; then
+  if [[ -t 0 ]]; then
+    read -r -p "Nginx HTTP port [80]: " NGINX_PORT
+  fi
+  NGINX_PORT="${NGINX_PORT:-80}"
+fi
+[[ "$NGINX_PORT" =~ ^[0-9]+$ ]] && (( NGINX_PORT >= 1 && NGINX_PORT <= 65535 )) || die "NGINX_PORT must be a valid TCP port."
+[[ "$NGINX_PORT" != "$PORT" ]] || die "NGINX_PORT and PORT must differ (Nginx proxies to the app's private PORT)."
+
+if [[ -z "$ENABLE_TLS" ]]; then
+  if [[ "$NGINX_PORT" == 80 ]]; then ENABLE_TLS=true; else ENABLE_TLS=false; fi
+fi
+case "${ENABLE_TLS,,}" in
+  1|true|yes|y) ENABLE_TLS=true ;;
+  0|false|no|n) ENABLE_TLS=false ;;
+  *) die "ENABLE_TLS must be true or false." ;;
+esac
+if [[ "$ENABLE_TLS" == true ]]; then
+  [[ "$NGINX_PORT" == 80 ]] || die "Let's Encrypt HTTP validation requires NGINX_PORT=80. Set ENABLE_TLS=false for a custom HTTP port."
+  if [[ -z "$CERTBOT_EMAIL" ]]; then
+    [[ -t 0 ]] || die "Set CERTBOT_EMAIL for automatic HTTPS, or set ENABLE_TLS=false."
+    read -r -p "Email for Let's Encrypt certificate notices: " CERTBOT_EMAIL
+  fi
+  [[ "$CERTBOT_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "CERTBOT_EMAIL must be a valid email address."
+fi
 
 install_build_tools() {
   local need_dotnet=false
@@ -86,6 +122,18 @@ PY
 
 install_build_tools
 
+if ! command -v nginx >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; then
+  log "Installing Nginx reverse proxy"
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y nginx curl
+fi
+if [[ "$ENABLE_TLS" == true ]] && ! command -v certbot >/dev/null 2>&1; then
+  log "Installing Certbot for automatic HTTPS"
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y certbot python3-certbot-nginx
+fi
+systemctl enable --now nginx.service
+
 if ! getent group "$APP_GROUP" >/dev/null; then
   groupadd --system "$APP_GROUP"
 fi
@@ -131,6 +179,7 @@ Restart=on-failure
 RestartSec=5
 Environment=ASPNETCORE_ENVIRONMENT=Production
 Environment=PORT=$PORT
+Environment=BIND_ADDRESS=127.0.0.1
 Environment=PORTFOLIO_DATA_DIR=$DATA_DIR
 NoNewPrivileges=true
 PrivateTmp=true
@@ -141,6 +190,34 @@ ReadWritePaths=$DATA_DIR
 [Install]
 WantedBy=multi-user.target
 UNIT
+
+# Nginx owns the public domain/port and forwards requests to private Kestrel.
+NGINX_SITE="/etc/nginx/sites-available/$SERVICE_NAME"
+cat > "$NGINX_SITE" <<NGINX
+server {
+    listen $NGINX_PORT;
+    listen [::]:$NGINX_PORT;
+    server_name $DOMAIN;
+
+    client_max_body_size 10m;
+    proxy_read_timeout 120s;
+
+    location / {
+        proxy_pass http://127.0.0.1:$PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$http_host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$http_host;
+        proxy_set_header X-Forwarded-Port \$server_port;
+    }
+}
+NGINX
+rm -f "/etc/nginx/sites-enabled/$SERVICE_NAME"
+ln -s "$NGINX_SITE" "/etc/nginx/sites-enabled/$SERVICE_NAME"
+nginx -t
+systemctl reload nginx.service
 
 PREVIOUS_TARGET="$(readlink "$INSTALL_ROOT/current" 2>/dev/null || true)"
 rm -f "$INSTALL_ROOT/current.next"
@@ -174,10 +251,38 @@ if [[ "$ready" != true ]]; then
   die "Deployment did not become healthy."
 fi
 
+log "Checking the Nginx domain/port route"
+curl -fsS --max-time 5 -H "Host: $DOMAIN" \
+  "http://127.0.0.1:$NGINX_PORT/api/health" >/dev/null || die "Nginx did not proxy $DOMAIN:$NGINX_PORT to the app."
+
+# When using the standard HTTP port, issue and configure a trusted TLS cert by
+# default. DNS for DOMAIN must point here and ports 80/443 must reach this host.
+if [[ "$ENABLE_TLS" == true ]]; then
+  log "Obtaining and configuring the HTTPS certificate for $DOMAIN"
+  certbot --nginx --non-interactive --agree-tos --redirect \
+    --email "$CERTBOT_EMAIL" --domains "$DOMAIN"
+  systemctl reload nginx.service
+fi
+
 log "Deployment succeeded"
+if [[ "$ENABLE_TLS" == true ]]; then
+  PUBLIC_SCHEME=https
+elif [[ "$NGINX_PORT" == 80 ]]; then
+  PUBLIC_SCHEME=http
+else
+  PUBLIC_SCHEME=http
+fi
+if [[ "$NGINX_PORT" == 80 && "$ENABLE_TLS" != true ]]; then
+  PUBLIC_URL="$PUBLIC_SCHEME://$DOMAIN"
+else
+  PUBLIC_URL="$PUBLIC_SCHEME://$DOMAIN:$NGINX_PORT"
+fi
 printf 'Service:     %s.service\n' "$SERVICE_NAME"
-printf 'Local URL:   http://127.0.0.1:%s\n' "$PORT"
+printf 'Public URL:  %s\n' "$PUBLIC_URL"
+printf 'Upstream:    http://127.0.0.1:%s (private; Nginx only)\n' "$PORT"
 printf 'Data dir:    %s\n' "$DATA_DIR"
 printf 'Release:     %s\n' "$RELEASE_DIR"
-printf '\nThe app listens on all interfaces at port %s. Put it behind HTTPS (for example, Nginx + Let\x27s Encrypt) before exposing it publicly.\n' "$PORT"
 printf 'Logs: journalctl -u %s.service -f\n' "$SERVICE_NAME"
+if [[ "$ENABLE_TLS" != true ]]; then
+  printf 'HTTPS is disabled. Do not send passwords or portfolio data over an unencrypted connection.\n'
+fi
