@@ -3,23 +3,12 @@
 # Run from the root of a fresh or updated checkout: sudo ./deploy-ubuntu24.sh
 set -Eeuo pipefail
 
-APP_NAME="glancefolio"
-APP_USER="${APP_USER:-glancefolio}"
-APP_GROUP="${APP_GROUP:-glancefolio}"
-INSTALL_ROOT="${INSTALL_ROOT:-/opt/glancefolio}"
-DATA_DIR="${DATA_DIR:-/var/lib/glancefolio}"
-SERVICE_NAME="${SERVICE_NAME:-glancefolio}"
-PORT="${PORT:-5000}"                 # Kestrel upstream port (localhost only)
-DOMAIN="${DOMAIN:-}"
-NGINX_PORT="${NGINX_PORT:-}"
-ENABLE_TLS="${ENABLE_TLS:-}"
-CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+DEPLOY_CONFIG="${DEPLOY_CONFIG:-$ROOT_DIR/deploy.conf}"
 CLIENT_DIR="$ROOT_DIR/src/Client"
 SERVER_PROJECT="$ROOT_DIR/src/Server/Server.csproj"
-RELEASES_DIR="$INSTALL_ROOT/releases"
 
-log() { printf '\n[%s] %s\n' "$APP_NAME" "$*"; }
+log() { printf '\n[glancefolio] %s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 [[ $EUID -eq 0 ]] || die "Run as root: sudo $0"
@@ -27,39 +16,39 @@ die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 # shellcheck disable=SC1091
 source /etc/os-release
 [[ "${ID:-}" == ubuntu && "${VERSION_ID:-}" == 24.04 ]] || die "This script supports Ubuntu 24.04 only (detected ${PRETTY_NAME:-unknown})."
+[[ -r "$DEPLOY_CONFIG" ]] || die "Missing deploy config: $DEPLOY_CONFIG. Copy deploy.conf.example to deploy.conf and edit it."
+# shellcheck disable=SC1090
+source "$DEPLOY_CONFIG"
+
+APP_NAME="glancefolio"
+APP_USER="${APP_USER:-glancefolio}"
+APP_GROUP="${APP_GROUP:-glancefolio}"
+INSTALL_ROOT="${INSTALL_ROOT:-/opt/glancefolio}"
+DATA_DIR="${DATA_DIR:-/var/lib/glancefolio}"
+SERVICE_NAME="${SERVICE_NAME:-glancefolio}"
+PORT="${PORT:-5000}"
+DOMAIN="${DOMAIN:-}"
+NGINX_PORT="${NGINX_PORT:-}"
+ENABLE_TLS="${ENABLE_TLS:-true}"
+CERTBOT_EMAIL="${CERTBOT_EMAIL:-}"
+RELEASES_DIR="$INSTALL_ROOT/releases"
+
 [[ -f "$CLIENT_DIR/package-lock.json" && -f "$SERVER_PROJECT" ]] || die "Run this script from the Glancefolio repository checkout."
-[[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "PORT must be a valid TCP port."
-
-if [[ -z "$DOMAIN" ]]; then
-  [[ -t 0 ]] || die "Set DOMAIN=example.com, or run interactively to enter the site domain."
-  read -r -p "Domain name for Glancefolio: " DOMAIN
-fi
+[[ -n "$DOMAIN" ]] || die "Set DOMAIN in $DEPLOY_CONFIG."
+[[ -n "$NGINX_PORT" ]] || die "Set NGINX_PORT in $DEPLOY_CONFIG."
 [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "DOMAIN must be a hostname or IPv4 address (no scheme, path, or port)."
-
-if [[ -z "$NGINX_PORT" ]]; then
-  if [[ -t 0 ]]; then
-    read -r -p "Nginx HTTP port [80]: " NGINX_PORT
-  fi
-  NGINX_PORT="${NGINX_PORT:-80}"
-fi
+[[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "PORT must be a valid TCP port."
 [[ "$NGINX_PORT" =~ ^[0-9]+$ ]] && (( NGINX_PORT >= 1 && NGINX_PORT <= 65535 )) || die "NGINX_PORT must be a valid TCP port."
 [[ "$NGINX_PORT" != "$PORT" ]] || die "NGINX_PORT and PORT must differ (Nginx proxies to the app's private PORT)."
 
-if [[ -z "$ENABLE_TLS" ]]; then
-  if [[ "$NGINX_PORT" == 80 ]]; then ENABLE_TLS=true; else ENABLE_TLS=false; fi
-fi
 case "${ENABLE_TLS,,}" in
   1|true|yes|y) ENABLE_TLS=true ;;
   0|false|no|n) ENABLE_TLS=false ;;
-  *) die "ENABLE_TLS must be true or false." ;;
+  *) die "ENABLE_TLS in $DEPLOY_CONFIG must be true or false." ;;
 esac
 if [[ "$ENABLE_TLS" == true ]]; then
-  [[ "$NGINX_PORT" == 80 ]] || die "Let's Encrypt HTTP validation requires NGINX_PORT=80. Set ENABLE_TLS=false for a custom HTTP port."
-  if [[ -z "$CERTBOT_EMAIL" ]]; then
-    [[ -t 0 ]] || die "Set CERTBOT_EMAIL for automatic HTTPS, or set ENABLE_TLS=false."
-    read -r -p "Email for Let's Encrypt certificate notices: " CERTBOT_EMAIL
-  fi
-  [[ "$CERTBOT_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "CERTBOT_EMAIL must be a valid email address."
+  [[ "$NGINX_PORT" == 80 ]] || die "Let's Encrypt HTTP validation requires NGINX_PORT=80. Set ENABLE_TLS=false in $DEPLOY_CONFIG for a custom HTTP port."
+  [[ "$CERTBOT_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || die "Set a valid CERTBOT_EMAIL in $DEPLOY_CONFIG for automatic HTTPS."
 fi
 
 check_nginx_port() {
@@ -74,14 +63,38 @@ check_nginx_port() {
   log "Preflight: port $NGINX_PORT already has a listener"
   printf '%s\n' "$listeners"
   if grep -Eq '"(apache2|httpd)"' <<< "$listeners"; then
-    cat >&2 <<EOF
-Port $NGINX_PORT is occupied by Apache. Nginx cannot bind the same public port.
-If that old site is no longer needed, disable its Apache virtual host, then reload Apache:
+    local has_apache_sites=false site
+    shopt -s nullglob
+    for site in /etc/apache2/sites-enabled/*.conf; do
+      if [[ -e "$site" ]]; then has_apache_sites=true; break; fi
+    done
+    shopt -u nullglob
+
+    if [[ -d /etc/apache2/sites-enabled && "$has_apache_sites" == false ]]; then
+      log "Apache still holds port $NGINX_PORT, but no Apache virtual hosts are enabled; stopping Apache to release the port"
+      systemctl disable --now apache2.service || die "Could not stop Apache. Stop it manually, then rerun."
+      sleep 1
+      listeners="$(ss -H -ltnp "sport = :$NGINX_PORT" 2>/dev/null || true)"
+      if [[ -z "$listeners" ]]; then
+        log "Apache stopped; port $NGINX_PORT is now free"
+        return
+      fi
+      if grep -Eq '"(apache2|httpd)"' <<< "$listeners"; then
+        die "Apache still owns port $NGINX_PORT after stopping its service. Check for other Apache workers and stop them before retrying."
+      fi
+    else
+      cat >&2 <<EOF
+Port $NGINX_PORT is occupied by Apache, and enabled Apache virtual hosts still exist:
+$(ls -l /etc/apache2/sites-enabled/ 2>/dev/null)
+Nginx cannot bind the same public port. Disable the old website(s), then rerun:
   sudo a2dissite <old-site>.conf
   sudo apachectl configtest && sudo systemctl reload apache2
-If you intend to remove that website entirely, back up its files/config first. Otherwise choose a different NGINX_PORT.
+If all Apache sites are retired, also stop/disable Apache to release its listener:
+  sudo systemctl disable --now apache2
+Otherwise keep Apache running and choose another NGINX_PORT or reconfigure Apache's Listen directive.
 EOF
-    die "Free Nginx port $NGINX_PORT and rerun the deployment."
+      die "Free Nginx port $NGINX_PORT and rerun the deployment."
+    fi
   fi
 
   if grep -q '"nginx"' <<< "$listeners"; then

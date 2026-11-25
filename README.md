@@ -48,32 +48,32 @@ chooses the data root (default `src/Server/data`). Accounts are stored in
 
 ### Bare-metal deployment (Ubuntu 24.04)
 
-From a fresh or updated checkout on the server, run:
+On the server, copy and edit the deploy config, then run the script:
 
 ```bash
+cp deploy.conf.example deploy.conf
+nano deploy.conf                 # set DOMAIN, NGINX_PORT, and CERTBOT_EMAIL
 sudo ./deploy-ubuntu24.sh
 ```
 
-The script prompts for the site domain and Nginx listener port (default `80`),
-checks for existing listeners, installs Nginx, and configures it to proxy that
-domain/port to the app on localhost. If Apache owns the requested port, the
-script stops and suggests how to disable the old virtual host; an existing Nginx
-listener is allowed to share the port, with guidance for removing a conflicting
-old site if necessary. It installs .NET 10 and Bun if missing, builds the client and server,
-installs a versioned release, and runs a systemd service. The health check
-verifies startup and rolls back to the previous release if it fails. User data
-persists under `/var/lib/glancefolio`.
+The script reads settings from `deploy.conf` (or the path in `DEPLOY_CONFIG`); it
+never prompts for values. It checks the selected port, installs Nginx, and
+configures the domain/port to proxy to Kestrel on localhost. If Apache owns the
+port and no Apache virtual hosts are enabled, it stops/disables Apache to release
+the port. If Apache sites are still enabled, it stops with instructions to
+disable the conflicting site. Existing Nginx listeners can share a port; if a
+site already claims the configured domain, the script reports how to disable it.
 
-On port `80`, HTTPS via Let's Encrypt is enabled by default; point the domain's
-DNS to this server and allow inbound ports `80` and `443`. The script prompts
-for the certificate email. For a custom HTTP listener port, TLS defaults off;
-use an external TLS terminator if you need HTTPS there. Non-interactive example:
+It installs .NET 10 and Bun if missing, builds the client/server, installs a
+versioned release, and runs a systemd service. A health check verifies the
+service and Nginx route, rolling back the release if app startup fails. User
+data persists under `/var/lib/glancefolio`.
 
-```bash
-sudo DOMAIN=portfolio.example.com NGINX_PORT=80 CERTBOT_EMAIL=admin@example.com ./deploy-ubuntu24.sh
-```
-
-`PORT` selects Kestrel's private localhost upstream port. Other overrides:
+With `NGINX_PORT=80` and `ENABLE_TLS=true`, the script obtains and configures a
+Let's Encrypt certificate. Point the domain's DNS to this server and allow
+inbound ports `80` and `443`; set `CERTBOT_EMAIL` in the config. For a custom
+HTTP port, set `ENABLE_TLS=false` and provide HTTPS through another TLS
+terminator. `PORT` is the private Kestrel upstream; additional settings include
 `DATA_DIR`, `INSTALL_ROOT`, `APP_USER`, and `SERVICE_NAME`.
 
 ---
