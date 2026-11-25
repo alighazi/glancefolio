@@ -51,6 +51,14 @@ try:
 except urllib.error.HTTPError as exc:
     anonymous_status = exc.code
 check("portfolio is unavailable without authentication", anonymous_status == 401, f"HTTP {anonymous_status}")
+try:
+    with urllib.request.urlopen(BASE + "/", timeout=10) as response:
+        shell_status = response.status
+        shell_html = response.read().decode(errors="replace")
+except urllib.error.HTTPError as exc:
+    shell_status, shell_html = exc.code, ""
+check("SPA sign-in shell is reachable before login",
+      shell_status == 200 and 'id="root"' in shell_html, f"HTTP {shell_status}")
 email = f"api-e2e-{time.time_ns()}@example.test"
 st, user, _ = call("POST", "/api/auth/register", dict(email=email, password="api-e2e-test-password-2026"))
 check("register creates an account and session", st == 200 and user.get("email") == email, f"HTTP {st}")

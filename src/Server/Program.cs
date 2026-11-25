@@ -499,7 +499,9 @@ app.MapPost("/api/portfolio/import", async (PortfolioStore store, FxService fx, 
 });
 
 // Single-page client: unknown non-API paths fall through to index.html.
-app.MapFallbackToFile("index.html");
+// The SPA must be available before sign-in so it can render the auth screen.
+// Portfolio/API endpoints remain protected by the fallback authorization policy.
+app.MapFallbackToFile("index.html").AllowAnonymous();
 
 app.Logger.LogInformation("Glancefolio data directory: {DataDir}", dataDir);
 app.Run();
